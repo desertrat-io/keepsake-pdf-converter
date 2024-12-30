@@ -1,36 +1,62 @@
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+}
+
+
 plugins {
     id 'java'
     id 'io.quarkus'
+    id "io.sentry.jvm.gradle" version "4.11.0"
 }
 
 repositories {
     mavenCentral()
     mavenLocal()
+    maven {
+        url "https://dl.cloudsmith.io/public/desertrat-io/keepsake/maven/"
+
+    }
+}
+
+
+sentry {
+    // Generates a JVM (Java, Kotlin, etc.) source bundle and uploads your source code to Sentry.
+    // This enables source context, allowing you to see your source
+    // code as part of your stack traces in Sentry.
+    includeSourceContext = true
+
+    org = "desertratio"
+    projectName = "keepsake-pdf-converter"
+    authToken = System.getenv("SENTRY_AUTH_TOKEN")
 }
 
 dependencies {
+    implementation 'io.quarkiverse.loggingsentry:quarkus-logging-sentry:2.0.7'
     implementation enforcedPlatform("${quarkusPlatformGroupId}:${quarkusPlatformArtifactId}:${quarkusPlatformVersion}")
     implementation enforcedPlatform("${quarkusPlatformGroupId}:quarkus-amazon-services-bom:${quarkusPlatformVersion}")
     implementation 'io.quarkus:quarkus-mongodb-client'
     implementation 'io.quarkus:quarkus-mongodb-panache'
-    implementation 'io.quarkus:quarkus-kafka-client'
-    implementation 'io.quarkus:quarkus-messaging-kafka'
-    implementation 'io.quarkus:quarkus-kafka-streams'
-    implementation 'io.quarkus:quarkus-redis-cache'
+    implementation 'io.quarkus:quarkus-grpc'
     implementation 'io.quarkus:quarkus-redis-client'
     implementation 'io.quarkiverse.amazonservices:quarkus-amazon-s3'
-    implementation 'io.quarkus:quarkus-reactive-pg-client'
-    implementation 'io.quarkus:quarkus-jdbc-postgresql'
+    implementation 'io.quarkiverse.amazonservices:quarkus-amazon-s3-transfer-manager'
     implementation 'io.quarkus:quarkus-arc'
+    implementation 'org.apache.pdfbox:pdfbox:3.0.2'
+    implementation 'com.eventstore:db-client-java:5.4.1'
+    implementation "${keepsakeGroupId}:${keepsakeProtoArtifactId}:${keepsakeProtoVersion}"
+    implementation 'org.jboss.logmanager:log4j2-jboss-logmanager'
+    implementation 'org.projectlombok:lombok:1.18.36'
     testImplementation 'io.quarkus:quarkus-junit5'
 }
 
 group 'io.desertrat'
-version '1.0-SNAPSHOT'
+version '1.0.0'
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_17
-    targetCompatibility = JavaVersion.VERSION_17
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
 }
 
 test {
@@ -44,3 +70,4 @@ compileJava {
 compileTestJava {
     options.encoding = 'UTF-8'
 }
+
