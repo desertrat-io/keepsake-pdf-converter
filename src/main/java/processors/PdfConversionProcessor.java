@@ -1,37 +1,56 @@
 package processors;
 
 
+import entities.PageEntity;
 import entities.PdfDocumentEntity;
+import events.DocumentSplit;
 import events.NewDocumentToProcess;
 import io.desertrat.keepsake.protocols.S3DataStoreOuterClass;
 import io.desertrat.keepsake.protocols.pdfconverter.ConvertPdfToJpegRequest;
 import io.quarkus.logging.Log;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
-import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
-import software.amazon.awssdk.regions.Region;
-import software.amazon.awssdk.services.s3.S3AsyncClient;
+import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.rendering.ImageType;
+import org.apache.pdfbox.rendering.PDFRenderer;
+import org.apache.pdfbox.tools.imageio.ImageIOUtil;
+import org.eclipse.microprofile.config.Config;
 import software.amazon.awssdk.transfer.s3.S3TransferManager;
+import software.amazon.awssdk.transfer.s3.model.CompletedDirectoryUpload;
+import software.amazon.awssdk.transfer.s3.model.DirectoryUpload;
 import software.amazon.awssdk.transfer.s3.model.DownloadFileRequest;
+import software.amazon.awssdk.transfer.s3.model.UploadDirectoryRequest;
 
+import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ExecutionException;
 
 @ApplicationScoped
-public class PdfConversionProcessor implements RequestProcessor<ConvertPdfToJpegRequest> {
+public class PdfConversionProcessor implements RequestProcessor<ConvertPdfToJpegRequest, List<PageEntity>> {
     private final NewDocumentToProcess newDocumentToProcess;
+    private final DocumentSplit documentSplit;
+    private final S3TransferManager s3Transfer;
+    private final int PAGE_DPI;
+    private final String BASE_LOCAL_DIRECTORY;
     private ConvertPdfToJpegRequest pdfToJpegRequest;
 
     @Inject
-    public PdfConversionProcessor(NewDocumentToProcess newDocumentToProcess) {
+    public PdfConversionProcessor(NewDocumentToProcess newDocumentToProcess, DocumentSplit documentSplit, S3TransferManager s3Transfer, Config config) {
         this.newDocumentToProcess = newDocumentToProcess;
+        this.documentSplit = documentSplit;
+        this.s3Transfer = s3Transfer;
+        this.PAGE_DPI = Integer.parseInt(config.getConfigValue("keepsake.pdf.page.dpi").getValue());
+        this.BASE_LOCAL_DIRECTORY = config.getConfigValue("keepsake.pdf.base.local").getValue();
     }
 
-    public void process(ConvertPdfToJpegRequest pdfToJpegRequest) {
+    public List<PageEntity> process(ConvertPdfToJpegRequest pdfToJpegRequest) throws ExecutionException, InterruptedException, IOException {
         this.pdfToJpegRequest = pdfToJpegRequest;
-        var s3Client = buildClient(pdfToJpegRequest.getS3DataStore().getRegion());
-        var s3Transfer = buildTransferManager(s3Client);
         Log.info("Trying to download " + pdfToJpegRequest.getFileLocator());
         try {
             Log.info("build the request");
@@ -46,34 +65,76 @@ public class PdfConversionProcessor implements RequestProcessor<ConvertPdfToJpeg
             var completedFileDownloadRequest = downloadedFile.completionFuture().join();
             Log.info(completedFileDownloadRequest.toString());
             Log.info("Grabbed {" + completedFileDownloadRequest.response().contentLength() + "} bytes");
-            var entity = new PdfDocumentEntity(pdfToJpegRequest.getS3DataStore().getFileKey(), pdfToJpegRequest.getFileName());
-
-            newDocumentToProcess.saveToEventStore(entity, pdfToJpegRequest.getS3DataStore().getFileKey());
-        } catch (Exception e) {
+            var fileKey = pdfToJpegRequest.getS3DataStore().getFileKey();
+            var entity = new PdfDocumentEntity();
+            entity.setFileKey(fileKey);
+            entity.setFileName(pdfToJpegRequest.getS3DataStore().getFileName());
+            var newPagePaths = splitDocument(BASE_LOCAL_DIRECTORY, fileKey, pdfToJpegRequest.getS3DataStore().getFileName());
+            entity.setNumPages(newPagePaths.size());
+            newDocumentToProcess.saveToEventStore(entity, fileKey);
+            var pathWithoutFile = fileKey.substring(0, fileKey.indexOf(pdfToJpegRequest.getS3DataStore().getFileName()));
+            var directoryUpload = buildDirectoryUploadRequest(pdfToJpegRequest.getS3DataStore(), BASE_LOCAL_DIRECTORY + pathWithoutFile);
+            CompletedDirectoryUpload completedDirectoryUpload = directoryUpload.completionFuture().join();
+            completedDirectoryUpload.failedTransfers().forEach(failedTransfer -> Log.warn(failedTransfer.toString() + " failed to upload"));
+            return newPagePaths;
+        } catch (InterruptedException | ExecutionException | IOException e) {
             Log.error(e);
+            throw e;
         }
 
     }
 
-    private S3AsyncClient buildClient(String region) {
-        return S3AsyncClient.builder()
-                .credentialsProvider(DefaultCredentialsProvider.create())
-                .multipartEnabled(true)
-                .region(Region.of(region))
-                .build();
-    }
-
-    private S3TransferManager buildTransferManager(S3AsyncClient s3Client) {
-        return S3TransferManager.builder().
-                s3Client(s3Client).build();
-    }
 
     private DownloadFileRequest buildDownloadObjectRequest(S3DataStoreOuterClass.S3DataStore dataStore) throws IOException {
-        Files.createDirectories(Path.of("/tmp/", dataStore.getFilePath()));
+        Files.createDirectories(Path.of(BASE_LOCAL_DIRECTORY, dataStore.getFilePath()));
         return DownloadFileRequest.builder()
                 .getObjectRequest(b -> b.bucket(dataStore.getBucketName())
                         .key(dataStore.getFileKey()))
-                .destination(Path.of("/tmp/", dataStore.getFileKey()))
+                .destination(Path.of(BASE_LOCAL_DIRECTORY, dataStore.getFileKey()))
                 .build();
+    }
+
+    private DirectoryUpload buildDirectoryUploadRequest(S3DataStoreOuterClass.S3DataStore dataStore, String directoryToUpload) throws IOException {
+        return s3Transfer.uploadDirectory(UploadDirectoryRequest.builder()
+                .source(Paths.get(directoryToUpload))
+                .s3Prefix(dataStore.getFilePath())
+                .bucket(dataStore.getBucketName())
+                .build());
+    }
+
+    private List<PageEntity> splitDocument(String pdfBasePath, String pdfFileKey, String pdfFileName) {
+
+        try {
+            Log.info("Trying to split: " + pdfFileKey);
+            var document = Loader.loadPDF(new File(BASE_LOCAL_DIRECTORY + pdfFileKey));
+            var renderer = new PDFRenderer(document);
+            Log.info("PDF Loaded, grabbing pages");
+            var pages = document.getPages();
+            var fileNameWithoutExtension = pdfFileName.substring(0, pdfFileName.indexOf("."));
+            var pathWithoutFile = pdfFileKey.substring(0, pdfFileKey.indexOf(pdfFileName));
+            Log.info("Pages retrieved, now splitting");
+            List<PageEntity> pageEntities = new ArrayList<>();
+            for (PDPage page : pages) {
+                var fileName = fileNameWithoutExtension + "_page_" + pages.indexOf(page) + ".jpg";
+                Log.info("splitting into " + fileName);
+                var bufferedImage = renderer.renderImageWithDPI(pages.indexOf(page), PAGE_DPI, ImageType.RGB);
+                ImageIOUtil.writeImage(bufferedImage, BASE_LOCAL_DIRECTORY + pathWithoutFile + '/' + fileName, PAGE_DPI);
+                var pageEntity = new PageEntity();
+                pageEntity.setFileName(fileName);
+                pageEntity.setFileFinalLocation(BASE_LOCAL_DIRECTORY + pathWithoutFile + '/' + fileName);
+                pageEntity.setPageNum(pages.indexOf(page) + 1);
+                pageEntity.setPageFileSize(0);
+                pageEntity.setContainingPath(BASE_LOCAL_DIRECTORY + pathWithoutFile);
+                pageEntities.add(pageEntity);
+                Log.info("Page added");
+                documentSplit.saveToEventStore(pageEntity, pdfFileKey);
+            }
+            document.close();
+            return pageEntities;
+        } catch (IOException | ExecutionException | InterruptedException e) {
+            Log.error(e);
+            Thread.currentThread().interrupt();
+            return List.of();
+        }
     }
 }

@@ -1,5 +1,8 @@
 package processors;
 
-public interface RequestProcessor<T> {
-    void process(T request);
+import java.io.IOException;
+import java.util.concurrent.ExecutionException;
+
+public interface RequestProcessor<T, R> {
+    R process(T request) throws ExecutionException, InterruptedException, IOException;
 }
