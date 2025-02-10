@@ -36,8 +36,8 @@ public class PdfConversionProcessor implements RequestProcessor<ConvertPdfToJpeg
     private final NewDocumentToProcess newDocumentToProcess;
     private final DocumentSplit documentSplit;
     private final S3TransferManager s3Transfer;
-    private final int PAGE_DPI;
-    private final String BASE_LOCAL_DIRECTORY;
+    private final int pageDpi;
+    private final String baseLocalDirectory;
     private ConvertPdfToJpegRequest pdfToJpegRequest;
 
     @Inject
@@ -45,8 +45,8 @@ public class PdfConversionProcessor implements RequestProcessor<ConvertPdfToJpeg
         this.newDocumentToProcess = newDocumentToProcess;
         this.documentSplit = documentSplit;
         this.s3Transfer = s3Transfer;
-        this.PAGE_DPI = Integer.parseInt(config.getConfigValue("keepsake.pdf.page.dpi").getValue());
-        this.BASE_LOCAL_DIRECTORY = config.getConfigValue("keepsake.pdf.base.local").getValue();
+        this.pageDpi = Integer.parseInt(config.getConfigValue("keepsake.pdf.page.dpi").getValue());
+        this.baseLocalDirectory = config.getConfigValue("keepsake.pdf.base.local").getValue();
     }
 
     public List<PageEntity> process(ConvertPdfToJpegRequest pdfToJpegRequest) throws ExecutionException, InterruptedException, IOException {
@@ -69,11 +69,11 @@ public class PdfConversionProcessor implements RequestProcessor<ConvertPdfToJpeg
             var entity = new PdfDocumentEntity();
             entity.setFileKey(fileKey);
             entity.setFileName(pdfToJpegRequest.getS3DataStore().getFileName());
-            var newPagePaths = splitDocument(BASE_LOCAL_DIRECTORY, fileKey, pdfToJpegRequest.getS3DataStore().getFileName());
+            var newPagePaths = splitDocument(baseLocalDirectory, fileKey, pdfToJpegRequest.getS3DataStore().getFileName());
             entity.setNumPages(newPagePaths.size());
             newDocumentToProcess.saveToEventStore(entity, fileKey);
             var pathWithoutFile = fileKey.substring(0, fileKey.indexOf(pdfToJpegRequest.getS3DataStore().getFileName()));
-            var directoryUpload = buildDirectoryUploadRequest(pdfToJpegRequest.getS3DataStore(), BASE_LOCAL_DIRECTORY + pathWithoutFile);
+            var directoryUpload = buildDirectoryUploadRequest(pdfToJpegRequest.getS3DataStore(), baseLocalDirectory + pathWithoutFile);
             CompletedDirectoryUpload completedDirectoryUpload = directoryUpload.completionFuture().join();
             completedDirectoryUpload.failedTransfers().forEach(failedTransfer -> Log.warn(failedTransfer.toString() + " failed to upload"));
             return newPagePaths;
@@ -86,11 +86,11 @@ public class PdfConversionProcessor implements RequestProcessor<ConvertPdfToJpeg
 
 
     private DownloadFileRequest buildDownloadObjectRequest(S3DataStoreOuterClass.S3DataStore dataStore) throws IOException {
-        Files.createDirectories(Path.of(BASE_LOCAL_DIRECTORY, dataStore.getFilePath()));
+        Files.createDirectories(Path.of(baseLocalDirectory, dataStore.getFilePath()));
         return DownloadFileRequest.builder()
                 .getObjectRequest(b -> b.bucket(dataStore.getBucketName())
                         .key(dataStore.getFileKey()))
-                .destination(Path.of(BASE_LOCAL_DIRECTORY, dataStore.getFileKey()))
+                .destination(Path.of(baseLocalDirectory, dataStore.getFileKey()))
                 .build();
     }
 
@@ -106,7 +106,7 @@ public class PdfConversionProcessor implements RequestProcessor<ConvertPdfToJpeg
 
         try {
             Log.info("Trying to split: " + pdfFileKey);
-            var document = Loader.loadPDF(new File(BASE_LOCAL_DIRECTORY + pdfFileKey));
+            var document = Loader.loadPDF(new File(baseLocalDirectory + pdfFileKey));
             var renderer = new PDFRenderer(document);
             Log.info("PDF Loaded, grabbing pages");
             var pages = document.getPages();
@@ -117,14 +117,14 @@ public class PdfConversionProcessor implements RequestProcessor<ConvertPdfToJpeg
             for (PDPage page : pages) {
                 var fileName = fileNameWithoutExtension + "_page_" + pages.indexOf(page) + ".jpg";
                 Log.info("splitting into " + fileName);
-                var bufferedImage = renderer.renderImageWithDPI(pages.indexOf(page), PAGE_DPI, ImageType.RGB);
-                ImageIOUtil.writeImage(bufferedImage, BASE_LOCAL_DIRECTORY + pathWithoutFile + '/' + fileName, PAGE_DPI);
+                var bufferedImage = renderer.renderImageWithDPI(pages.indexOf(page), pageDpi, ImageType.RGB);
+                ImageIOUtil.writeImage(bufferedImage, baseLocalDirectory + pathWithoutFile + '/' + fileName, pageDpi);
                 var pageEntity = new PageEntity();
                 pageEntity.setFileName(fileName);
-                pageEntity.setFileFinalLocation(BASE_LOCAL_DIRECTORY + pathWithoutFile + '/' + fileName);
+                pageEntity.setFileFinalLocation(baseLocalDirectory + pathWithoutFile + '/' + fileName);
                 pageEntity.setPageNum(pages.indexOf(page) + 1);
                 pageEntity.setPageFileSize(0);
-                pageEntity.setContainingPath(BASE_LOCAL_DIRECTORY + pathWithoutFile);
+                pageEntity.setContainingPath(baseLocalDirectory + pathWithoutFile);
                 pageEntities.add(pageEntity);
                 Log.info("Page added");
                 documentSplit.saveToEventStore(pageEntity, pdfFileKey);
